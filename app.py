@@ -223,8 +223,32 @@ def _row_is_candidate(desc_lower: str) -> bool:
 def _connected_from_label(label) -> bool:
     if label is None:
         return False
-    s = str(label).lower()
+    s = str(label).strip().lower()
+    if not s or s == "nan":
+        return False
     return ("connected" in s) and ("not connected" not in s)
+
+
+def _connected_from_reach_status_or_label(status, label) -> bool:
+    status_str = "" if status is None else str(status).strip().lower()
+
+    if not status_str or status_str == "nan":
+        return _connected_from_label(label)
+
+    false_exact_values = {
+        "not connected",
+        "not answered",
+        "voicemail",
+        "hung up",
+    }
+
+    if status_str in false_exact_values:
+        return False
+
+    if "not connected" in status_str:
+        return False
+
+    return "connected" in status_str
 
 
 def _tier_from_label(label):
@@ -451,9 +475,11 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
     deal_email_col = "Person - Email"
     deal_owner_col = "Deal - Owner"
     deal_label_col = "Deal - Label"
+    deal_reach_status_col = "Deal - Reach Status"
     deal_value_col = "Deal - Deal value"
 
-    missing = [c for c in [deal_date_col, deal_email_col, deal_owner_col, deal_label_col] if c not in deals_df.columns]
+    required_cols = [deal_date_col, deal_email_col, deal_owner_col, deal_label_col, deal_reach_status_col]
+    missing = [c for c in required_cols if c not in deals_df.columns]
     if missing:
         raise KeyError(f"Deals file missing columns: {missing}")
 
@@ -464,8 +490,13 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
 
     deals["DealMonth"] = deals["_deal_created_dt"].dt.to_period("M").dt.to_timestamp()
     deals["EmailKey"] = deals[deal_email_col].map(_normalize_email)
+
     deals["Tier"] = deals[deal_label_col].map(_tier_from_label)
-    deals["Connected"] = deals[deal_label_col].map(_connected_from_label)
+
+    deals["Connected"] = [
+        _connected_from_reach_status_or_label(status, label)
+        for status, label in zip(deals[deal_reach_status_col], deals[deal_label_col])
+    ]
 
     deals["_is_pipedrive_krispcall"] = (
         deals[deal_owner_col].astype(str).str.strip().str.lower() == "pipedrive krispcall"
@@ -519,7 +550,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
     desc_lower = desc.str.lower().str.strip()
     breakdown_clean = npm_valid["Amount Breakdown"].apply(_clean_breakdown_str)
 
-    # Annual start also includes "Upgrade plan to yearly subscription."
     annual_start = (npm_valid["AmountNum"].fillna(0) > ANNUAL_AMOUNT_THRESHOLD) & (
         desc_lower.str.contains("workspace subscription", na=False)
         | (desc_lower == ANNUAL_UPGRADE_DESC_EXACT)
@@ -542,13 +572,10 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
     )
     annual_user_set = set(annual_candidates["EmailKey"].unique())
 
-    # Renewal payments mapping
     cond_email_in_desc = contains_email
     cond_number_purchased = desc_lower.str.contains("number purchased", na=False)
     cond_agent_added = desc_lower.str.contains("agent added", na=False) & desc.str.contains(",", na=False)
     cond_workspace_sub = desc_lower.str.contains("workspace subscription", na=False)
-
-    # Number Renew mapping only for annual users
     cond_number_renew_for_mapping = desc_lower.str.contains("number renew", na=False) & npm_valid["EmailKey"].isin(annual_user_set)
 
     renewal_mask = (
@@ -581,7 +608,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
         except Exception:
             return default
 
-    # Amounts
     deals_dedup["Current Month Renew Amount"] = [
         float(_map_from_latest(e, m, "AmountNum", np.nan)) if pd.notna(_map_from_latest(e, m, "AmountNum", np.nan)) else np.nan
         for e, m in zip(deals_dedup["EmailKey"], deals_dedup["DealMonth"])
@@ -591,7 +617,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
         for e, m in zip(deals_dedup["EmailKey"], deals_dedup["PrevDealMonth"])
     ]
 
-    # Dates. Date-only (no time)
     deals_dedup["Current Month Renew Date"] = [
         _map_from_latest(e, m, "PayDT", pd.NaT)
         for e, m in zip(deals_dedup["EmailKey"], deals_dedup["DealMonth"])
@@ -603,7 +628,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
     deals_dedup["Current Month Renew Date"] = deals_dedup["Current Month Renew Date"].apply(_dt_to_date_only)
     deals_dedup["Previous Month Renew Date"] = deals_dedup["Previous Month Renew Date"].apply(_dt_to_date_only)
 
-    # Flags
     deals_dedup["Current Month Renew Multiple Flag"] = [
         bool(_map_from_latest(e, m, "Renew Multiple Flag", False))
         for e, m in zip(deals_dedup["EmailKey"], deals_dedup["DealMonth"])
@@ -613,7 +637,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
         for e, m in zip(deals_dedup["EmailKey"], deals_dedup["PrevDealMonth"])
     ]
 
-    # Deal-month index for validity rolling
     deal_month_index = (
         deals_dedup[["EmailKey", "DealMonth"]]
         .dropna(subset=["EmailKey", "DealMonth"])
@@ -621,7 +644,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
         .sort_values(["EmailKey", "DealMonth"], kind="mergesort")
     )
 
-    # Monthly validity should NOT be extended by Number Renew
     renewals_for_validity = renewals.copy()
     renewals_for_validity = renewals_for_validity[
         ~renewals_for_validity["Amount Description"].astype(str).str.contains("number renew", case=False, na=False)
@@ -645,7 +667,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
         how="left",
     )
 
-    # Annual rolling
     annual_simple = annual_candidates.dropna(subset=["EmailKey", "PayDT"]).copy()
     annual_simple = annual_simple.assign(PayMonth=annual_simple["PayDT"].dt.to_period("M").dt.to_timestamp())
     annual_simple = annual_simple.sort_values(["EmailKey", "PayMonth", "PayDT"], kind="mergesort")
@@ -668,10 +689,8 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
         how="left",
     )
 
-    # Month-end cutoffs
     deals_dedup["NextMonthStart"] = (deals_dedup["DealMonth"] + pd.offsets.MonthBegin(1)).dt.normalize()
 
-    # Valid till
     deals_dedup["Monthly Valid Till (AsOf MonthEnd)"] = deals_dedup["Latest Monthly PayDT (AsOf MonthEnd)"].apply(_add_month)
     deals_dedup["Annual Valid Till (AsOf MonthEnd)"] = deals_dedup["Latest Annual PayDT (AsOf MonthEnd)"].apply(_add_year)
 
@@ -689,7 +708,6 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
 
     deals_dedup["Churned (AsOf MonthEnd)"] = ~deals_dedup["Active Subscription (AsOf MonthEnd)"]
 
-    # Upsell rules
     prev_amt = deals_dedup["Previous Month Renew Amount"].fillna(0.0)
     curr_amt = deals_dedup["Current Month Renew Amount"].fillna(0.0)
 
@@ -706,7 +724,13 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
     return out, summary_all, summary_connected, summary_owner_cs
 
 
-def make_excel(deals_raw: pd.DataFrame, deals_enriched: pd.DataFrame, summary_all: pd.DataFrame, summary_connected: pd.DataFrame, summary_owner_cs: pd.DataFrame) -> bytes:
+def make_excel(
+    deals_raw: pd.DataFrame,
+    deals_enriched: pd.DataFrame,
+    summary_all: pd.DataFrame,
+    summary_connected: pd.DataFrame,
+    summary_owner_cs: pd.DataFrame,
+) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         deals_enriched.to_excel(writer, sheet_name="Deals_enriched", index=False)
@@ -728,13 +752,14 @@ def kpi_row(summary_df: pd.DataFrame):
         return
 
     latest = overall.sort_values("DealMonth").iloc[-1]
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Accounts", int(latest["Accounts"]))
     c2.metric("Churned", int(latest["Churned"]))
     churn_pct = float(latest["Churn %"]) * 100 if pd.notna(latest["Churn %"]) else np.nan
     c3.metric("Churn %", f"{churn_pct:.2f}%" if pd.notna(churn_pct) else "NA")
     c4.metric("Annual Active", int(latest["Annual Active"]))
-    c5.metric("Upsell Sum", f'{float(latest["Upsell Net Change Sum"]):,.2f}')
+    c5.metric("Upsell Net Sum", f'{float(latest["Upsell Net Change Sum"]):,.2f}')
+    c6.metric("Upsell Positive Only", f'{float(latest["Upsell Positive Only Sum"]):,.2f}')
 
 
 def main():
@@ -813,6 +838,8 @@ def main():
             st.line_chart(overall.set_index("DealMonth")[["Churned"]])
             st.caption("Upsell net change sum over time")
             st.line_chart(overall.set_index("DealMonth")[["Upsell Net Change Sum"]])
+            st.caption("Upsell positive only sum over time")
+            st.line_chart(overall.set_index("DealMonth")[["Upsell Positive Only Sum"]])
 
     with tab3:
         st.dataframe(deals_enriched, use_container_width=True)
