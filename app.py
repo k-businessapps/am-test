@@ -1,3 +1,4 @@
+
 import re
 import json
 from io import BytesIO
@@ -202,24 +203,6 @@ def _epoch_to_dt_naive(series: pd.Series) -> pd.Series:
     return dt.dt.tz_convert(None)
 
 
-def _row_is_candidate(desc_lower: str) -> bool:
-    if not desc_lower:
-        return False
-    if "workspace subscription" in desc_lower:
-        return True
-    if "upgrade plan to yearly subscription" in desc_lower:
-        return True
-    if "number purchased" in desc_lower:
-        return True
-    if "agent added" in desc_lower and "," in desc_lower:
-        return True
-    if "number renew" in desc_lower:
-        return True
-    if EMAIL_RE.search(desc_lower):
-        return True
-    return False
-
-
 def _connected_from_label(label) -> bool:
     if label is None:
         return False
@@ -284,8 +267,60 @@ def _clean_breakdown_str(x) -> str:
         return ""
     s = str(x)
     s = s.replace("\u00a0", "")
+    s = s.replace(",", "")
     s = re.sub(r"\s+", "", s)
     return s
+
+
+def _combine_breakdown_text(amount_breakdown, amount_breakdown_by_unit) -> str:
+    return f"{'' if pd.isna(amount_breakdown) else amount_breakdown} {'' if pd.isna(amount_breakdown_by_unit) else amount_breakdown_by_unit}"
+
+
+def _breakdown_has_annual_number(amount_breakdown, amount_breakdown_by_unit) -> bool:
+    combined = _combine_breakdown_text(amount_breakdown, amount_breakdown_by_unit)
+    cleaned = _clean_breakdown_str(combined)
+    return any(n in cleaned for n in ALLOWED_ANNUAL_BREAKDOWN_NUMS)
+
+
+def _build_prefilter_flags(desc_lower: str, amount_breakdown=None, amount_breakdown_by_unit=None) -> dict:
+    desc_lower = "" if desc_lower is None else str(desc_lower).strip().lower()
+    breakdown_has_annual_num = _breakdown_has_annual_number(amount_breakdown, amount_breakdown_by_unit)
+
+    flags = {
+        "pf_workspace_subscription": "workspace subscription" in desc_lower,
+        "pf_upgrade_yearly": ANNUAL_UPGRADE_DESC_EXACT in desc_lower,
+        "pf_number_purchased": "number purchased" in desc_lower,
+        "pf_agent_added_any": "agent added" in desc_lower,
+        "pf_agent_added_with_comma": ("agent added" in desc_lower) and ("," in desc_lower),
+        "pf_number_renew": "number renew" in desc_lower,
+        "pf_email_regex": bool(EMAIL_RE.search(desc_lower)),
+        "pf_breakdown_has_annual_num": breakdown_has_annual_num,
+    }
+
+    flags["pf_keep_old"] = (
+        flags["pf_workspace_subscription"]
+        or flags["pf_upgrade_yearly"]
+        or flags["pf_number_purchased"]
+        or flags["pf_agent_added_with_comma"]
+        or flags["pf_number_renew"]
+        or flags["pf_email_regex"]
+    )
+
+    flags["pf_keep_new"] = (
+        flags["pf_workspace_subscription"]
+        or flags["pf_upgrade_yearly"]
+        or flags["pf_number_purchased"]
+        or flags["pf_agent_added_any"]
+        or flags["pf_number_renew"]
+        or flags["pf_email_regex"]
+        or flags["pf_breakdown_has_annual_num"]
+    )
+    return flags
+
+
+def _row_is_candidate(desc_lower: str, amount_breakdown=None, amount_breakdown_by_unit=None) -> bool:
+    flags = _build_prefilter_flags(desc_lower, amount_breakdown, amount_breakdown_by_unit)
+    return flags["pf_keep_new"]
 
 
 def _dt_to_date_only(x):
@@ -304,8 +339,23 @@ def _safe_parse_date(v):
         return None
 
 
+def _filter_df_text(df: pd.DataFrame, q: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    q = "" if q is None else str(q).strip()
+    if not q:
+        return df
+    mask = pd.Series(False, index=df.index)
+    for col in df.columns:
+        try:
+            mask = mask | df[col].astype(str).str.contains(q, case=False, na=False)
+        except Exception:
+            continue
+    return df[mask].copy()
+
+
 # -------------------------
-# Mixpanel fetch. Reduced columns
+# Mixpanel fetch. Reduced columns + diagnostics
 # -------------------------
 @st.cache_data(show_spinner=False, ttl=60 * 60, max_entries=3)
 def fetch_mixpanel_npm(to_date: date):
@@ -338,14 +388,17 @@ def fetch_mixpanel_npm(to_date: date):
     headers = {"accept": "text/plain", "authorization": str(mp["auth_header"]).strip()}
 
     kept = {}
+    debug_rows = []
     stats = {
         "from_date_used": from_date,
         "to_date_used": to_date_str,
         "lines_read": 0,
-        "rows_kept_prefilter": 0,
+        "rows_kept_prefilter_old_logic": 0,
+        "rows_kept_prefilter_new_logic": 0,
         "rows_dedup_final": 0,
         "dupes_replaced": 0,
         "dupes_skipped": 0,
+        "diag_rows_logged": 0,
     }
 
     with requests.get(url, headers=headers, stream=True, timeout=240) as r:
@@ -375,10 +428,54 @@ def fetch_mixpanel_npm(to_date: date):
 
             desc = rec.get("Amount Description")
             desc_lower = str(desc).lower().strip() if desc is not None else ""
-            if not _row_is_candidate(desc_lower):
-                continue
+            flags = _build_prefilter_flags(
+                desc_lower,
+                rec.get("Amount Breakdown"),
+                rec.get("Amount Breakdown by Unit"),
+            )
 
-            stats["rows_kept_prefilter"] += 1
+            if flags["pf_keep_old"]:
+                stats["rows_kept_prefilter_old_logic"] += 1
+            if flags["pf_keep_new"]:
+                stats["rows_kept_prefilter_new_logic"] += 1
+
+            amount_num = pd.to_numeric(pd.Series([rec.get("Amount")]), errors="coerce").iloc[0]
+            interesting_row = (
+                flags["pf_keep_new"]
+                or flags["pf_breakdown_has_annual_num"]
+                or flags["pf_agent_added_any"]
+                or flags["pf_number_purchased"]
+                or (pd.notna(amount_num) and float(amount_num) > ANNUAL_AMOUNT_THRESHOLD)
+            )
+
+            if interesting_row:
+                debug_rows.append(
+                    {
+                        "event": rec.get("event"),
+                        "distinct_id": rec.get("distinct_id"),
+                        "$insert_id": rec.get("$insert_id"),
+                        "$email": rec.get("$email"),
+                        "Amount": rec.get("Amount"),
+                        "AmountNum": float(amount_num) if pd.notna(amount_num) else np.nan,
+                        "Amount Description": rec.get("Amount Description"),
+                        "Amount Breakdown": rec.get("Amount Breakdown"),
+                        "Amount Breakdown by Unit": rec.get("Amount Breakdown by Unit"),
+                        "pf_workspace_subscription": flags["pf_workspace_subscription"],
+                        "pf_upgrade_yearly": flags["pf_upgrade_yearly"],
+                        "pf_number_purchased": flags["pf_number_purchased"],
+                        "pf_agent_added_any": flags["pf_agent_added_any"],
+                        "pf_agent_added_with_comma": flags["pf_agent_added_with_comma"],
+                        "pf_number_renew": flags["pf_number_renew"],
+                        "pf_email_regex": flags["pf_email_regex"],
+                        "pf_breakdown_has_annual_num": flags["pf_breakdown_has_annual_num"],
+                        "pf_keep_old": flags["pf_keep_old"],
+                        "pf_keep_new": flags["pf_keep_new"],
+                        "kept_after_prefilter": flags["pf_keep_new"],
+                    }
+                )
+
+            if not flags["pf_keep_new"]:
+                continue
 
             event = rec.get("event")
             distinct_id = rec.get("distinct_id")
@@ -416,8 +513,10 @@ def fetch_mixpanel_npm(to_date: date):
 
     rows = [v[1] for v in kept.values()]
     df = pd.DataFrame(rows) if rows else pd.DataFrame()
+    debug_df = pd.DataFrame(debug_rows) if debug_rows else pd.DataFrame()
     stats["rows_dedup_final"] = len(df)
-    return df, stats
+    stats["diag_rows_logged"] = len(debug_df)
+    return df, stats, debug_df
 
 
 # -------------------------
@@ -486,7 +585,7 @@ def summarize_owner_connected_status(deals_enriched: pd.DataFrame) -> pd.DataFra
 
 
 # -------------------------
-# Core enrichment
+# Core enrichment + diagnostics
 # -------------------------
 def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
     deal_date_col = "Deal - Deal created on"
@@ -538,12 +637,17 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
     deals_dedup = deals_sorted.drop_duplicates(subset=["_dedup_key"], keep="first").copy()
     deals_dedup["PrevDealMonth"] = (deals_dedup["DealMonth"] - pd.offsets.MonthBegin(1)).dt.to_period("M").dt.to_timestamp()
 
+    debug_frames = {}
+
     if npm_df is None or npm_df.empty:
         out = deals_dedup.drop(columns=["_dedup_key"], errors="ignore").copy()
         summary_all = summarize_basic(out, False)
         summary_connected = summarize_basic(out, True)
         summary_owner_cs = summarize_owner_connected_status(out)
-        return out, summary_all, summary_connected, summary_owner_cs
+        debug_frames["Diagnostics_npm_stage"] = pd.DataFrame()
+        debug_frames["Diagnostics_annual_logic"] = pd.DataFrame()
+        debug_frames["Diagnostics_deal_mapping"] = out.copy()
+        return out, summary_all, summary_connected, summary_owner_cs, debug_frames
 
     npm = npm_df.copy()
     npm = npm.loc[:, ~npm.columns.duplicated()].copy()
@@ -560,29 +664,121 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
     npm["PayMonth"] = npm["PayDT"].dt.to_period("M").dt.to_timestamp()
     npm["AmountNum"] = pd.to_numeric(npm["Amount"], errors="coerce")
 
-    npm["EmailKey"] = npm["$email"].map(_normalize_email)
-    npm["EmailKey"] = npm["EmailKey"].fillna(npm["Amount Description"].map(_extract_email_from_text))
-    npm_valid = npm.dropna(subset=["EmailKey", "PayDT"]).copy()
+    npm["EmailKey_FromEmail"] = npm["$email"].map(_normalize_email)
+    npm["EmailKey_FromDesc"] = npm["Amount Description"].map(_extract_email_from_text)
+    npm["EmailKey"] = npm["EmailKey_FromEmail"].fillna(npm["EmailKey_FromDesc"])
+
+    npm["Breakdown Combined"] = [
+        _combine_breakdown_text(a, b)
+        for a, b in zip(npm["Amount Breakdown"], npm["Amount Breakdown by Unit"])
+    ]
+    npm["Breakdown Clean"] = npm["Breakdown Combined"].apply(_clean_breakdown_str)
+    npm["Breakdown Has Annual Num"] = npm["Breakdown Clean"].apply(
+        lambda x: any(n in x for n in ALLOWED_ANNUAL_BREAKDOWN_NUMS)
+    )
+
+    npm["Has EmailKey"] = npm["EmailKey"].notna()
+    npm["Has PayDT"] = npm["PayDT"].notna()
+    npm["Survives npm_valid"] = npm["Has EmailKey"] & npm["Has PayDT"]
+
+    npm_stage_debug = npm[
+        [
+            "$email",
+            "EmailKey_FromEmail",
+            "EmailKey_FromDesc",
+            "EmailKey",
+            "Amount",
+            "AmountNum",
+            "Amount Description",
+            "Amount Breakdown",
+            "Amount Breakdown by Unit",
+            "Breakdown Combined",
+            "Breakdown Clean",
+            "Breakdown Has Annual Num",
+            "time",
+            "PayDT",
+            "PayMonth",
+            "Has EmailKey",
+            "Has PayDT",
+            "Survives npm_valid",
+        ]
+    ].copy()
+
+    debug_frames["Diagnostics_npm_stage"] = npm_stage_debug
+
+    npm_valid = npm[npm["Survives npm_valid"]].copy()
 
     desc = npm_valid["Amount Description"].astype(str)
     desc_lower = desc.str.lower().str.strip()
-    breakdown_clean = npm_valid["Amount Breakdown"].apply(_clean_breakdown_str)
+    breakdown_clean = npm_valid["Breakdown Clean"]
 
     annual_start = (npm_valid["AmountNum"].fillna(0) > ANNUAL_AMOUNT_THRESHOLD) & (
         desc_lower.str.contains("workspace subscription", na=False)
         | (desc_lower == ANNUAL_UPGRADE_DESC_EXACT)
     )
 
-    desc_no_comma = ~desc.str.contains(",", na=False)
+    desc_has_comma = desc.str.contains(",", na=False)
+    desc_no_comma = ~desc_has_comma
     contains_email = pd.Series(
         [(e in d) if (e and isinstance(d, str)) else False for e, d in zip(npm_valid["EmailKey"], desc_lower)],
         index=npm_valid.index,
     )
 
     breakdown_mask = breakdown_clean.apply(lambda x: any(n in x for n in ALLOWED_ANNUAL_BREAKDOWN_NUMS))
-    annual_renew = (npm_valid["AmountNum"].fillna(0) > ANNUAL_AMOUNT_THRESHOLD) & (
+
+    cond_agent_added_any = desc_lower.str.contains("agent added", na=False)
+    cond_number_purchased_any = desc_lower.str.contains("number purchased", na=False)
+    cond_number_renew_any = desc_lower.str.contains("number renew", na=False)
+    cond_workspace_sub_any = desc_lower.str.contains("workspace subscription", na=False)
+
+    # Original logic kept for comparison/debug.
+    annual_renew_original = (npm_valid["AmountNum"].fillna(0) > ANNUAL_AMOUNT_THRESHOLD) & (
         (contains_email & desc_no_comma) | breakdown_mask
     )
+
+    # Explicit new logic requested by user.
+    annual_renew_action_with_breakdown = (
+        (npm_valid["AmountNum"].fillna(0) > ANNUAL_AMOUNT_THRESHOLD)
+        & breakdown_mask
+        & (cond_agent_added_any | cond_number_purchased_any)
+    )
+
+    annual_renew = annual_renew_original | annual_renew_action_with_breakdown
+
+    annual_debug = npm_valid[
+        [
+            "$email",
+            "EmailKey",
+            "Amount",
+            "AmountNum",
+            "Amount Description",
+            "Amount Breakdown",
+            "Amount Breakdown by Unit",
+            "Breakdown Clean",
+            "PayDT",
+            "PayMonth",
+        ]
+    ].copy()
+    annual_debug["contains_email"] = contains_email.values
+    annual_debug["desc_has_comma"] = desc_has_comma.values
+    annual_debug["desc_no_comma"] = desc_no_comma.values
+    annual_debug["breakdown_mask"] = breakdown_mask.values
+    annual_debug["cond_agent_added_any"] = cond_agent_added_any.values
+    annual_debug["cond_number_purchased_any"] = cond_number_purchased_any.values
+    annual_debug["cond_number_renew_any"] = cond_number_renew_any.values
+    annual_debug["cond_workspace_sub_any"] = cond_workspace_sub_any.values
+    annual_debug["annual_start"] = annual_start.values
+    annual_debug["annual_renew_original"] = annual_renew_original.values
+    annual_debug["annual_renew_action_with_breakdown"] = annual_renew_action_with_breakdown.values
+    annual_debug["annual_renew_final"] = annual_renew.values
+    annual_debug["annual_candidate"] = (annual_start | annual_renew).values
+    annual_debug["annual_payment_type_preview"] = np.where(
+        annual_start,
+        "Subscription",
+        np.where(annual_renew, "Renew", ""),
+    )
+
+    debug_frames["Diagnostics_annual_logic"] = annual_debug
 
     annual_candidates = npm_valid[annual_start | annual_renew].copy()
     annual_candidates["Annual Payment Type"] = np.where(
@@ -590,10 +786,10 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
     )
 
     cond_email_in_desc = contains_email
-    cond_number_purchased = desc_lower.str.contains("number purchased", na=False)
-    cond_agent_added = desc_lower.str.contains("agent added", na=False) & desc.str.contains(",", na=False)
-    cond_workspace_sub = desc_lower.str.contains("workspace subscription", na=False)
-    cond_number_renew = desc_lower.str.contains("number renew", na=False)
+    cond_number_purchased = cond_number_purchased_any
+    cond_agent_added = cond_agent_added_any & desc_has_comma
+    cond_workspace_sub = cond_workspace_sub_any
+    cond_number_renew = cond_number_renew_any
 
     renewal_mask = (
         cond_email_in_desc
@@ -601,6 +797,7 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
         | cond_agent_added
         | cond_workspace_sub
         | cond_number_renew
+        | annual_renew_action_with_breakdown
     )
 
     renewals = npm_valid[renewal_mask].copy()
@@ -706,12 +903,10 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
         how="left",
     )
 
-    # -------------------------------------------------
     # Critical churn fix.
     # If Current Month Renew Date exists inside the same DealMonth,
     # force it into Latest Monthly PayDT when the roll missed it.
     # Then forward fill again by EmailKey.
-    # -------------------------------------------------
     deals_dedup["Current Month Renew DT Fallback"] = pd.to_datetime(
         deals_dedup["Current Month Renew Date"], errors="coerce"
     )
@@ -762,10 +957,33 @@ def build_enriched_deals(deals_df: pd.DataFrame, npm_df: pd.DataFrame):
     deals_dedup = deals_dedup.drop(columns=["Current Month Renew DT Fallback"], errors="ignore")
 
     out = deals_dedup.drop(columns=["_dedup_key"], errors="ignore").copy()
+
+    deal_mapping_debug_cols = [
+        deal_email_col,
+        "EmailKey",
+        deal_owner_col,
+        "DealMonth",
+        "PrevDealMonth",
+        "Current Month Renew Amount",
+        "Current Month Renew Date",
+        "Current Month Renew Multiple Flag",
+        "Previous Month Renew Amount",
+        "Previous Month Renew Date",
+        "Previous Month Renew Multiple Flag",
+        "Latest Monthly PayDT (AsOf MonthEnd)",
+        "Latest Annual PayDT (AsOf MonthEnd)",
+        "Annual Payment Type (AsOf MonthEnd)",
+        "Annual Active (AsOf MonthEnd)",
+        "Active Subscription (AsOf MonthEnd)",
+        "Churned (AsOf MonthEnd)",
+    ]
+    deal_mapping_debug_cols = [c for c in deal_mapping_debug_cols if c in out.columns]
+    debug_frames["Diagnostics_deal_mapping"] = out[deal_mapping_debug_cols].copy()
+
     summary_all = summarize_basic(out, False)
     summary_connected = summarize_basic(out, True)
     summary_owner_cs = summarize_owner_connected_status(out)
-    return out, summary_all, summary_connected, summary_owner_cs
+    return out, summary_all, summary_connected, summary_owner_cs, debug_frames
 
 
 def make_excel(
@@ -774,6 +992,8 @@ def make_excel(
     summary_all: pd.DataFrame,
     summary_connected: pd.DataFrame,
     summary_owner_cs: pd.DataFrame,
+    mixpanel_stats: dict | None = None,
+    debug_frames: dict | None = None,
 ) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -782,6 +1002,20 @@ def make_excel(
         summary_connected.to_excel(writer, sheet_name="Summary_connected", index=False)
         summary_owner_cs.to_excel(writer, sheet_name="Summary_owner_connected_status", index=False)
         deals_raw.to_excel(writer, sheet_name="Deals_raw", index=False)
+
+        stats_df = pd.DataFrame(
+            [{"metric": k, "value": v} for k, v in (mixpanel_stats or {}).items()]
+        )
+        stats_df.to_excel(writer, sheet_name="Mixpanel_fetch_stats", index=False)
+
+        if debug_frames:
+            for sheet_name, df in debug_frames.items():
+                safe_sheet_name = str(sheet_name)[:31]
+                if df is None:
+                    pd.DataFrame().to_excel(writer, sheet_name=safe_sheet_name, index=False)
+                else:
+                    df.to_excel(writer, sheet_name=safe_sheet_name, index=False)
+
     return output.getvalue()
 
 
@@ -823,6 +1057,7 @@ def main():
     deals_file = st.sidebar.file_uploader("Upload Deals CSV", type=["csv"])
     fetch_btn = st.sidebar.button("Fetch payments", type="primary")
     focus_connected = st.sidebar.toggle("Connected only view", value=False)
+    debug_filter = st.sidebar.text_input("Diagnostics filter", value="", help="Filter diagnostics by email or any text.")
 
     if deals_file is None:
         st.info("Upload your Deals CSV to begin.")
@@ -834,12 +1069,15 @@ def main():
         st.session_state["npm_cached"] = None
     if "npm_stats" not in st.session_state:
         st.session_state["npm_stats"] = None
+    if "fetch_debug_cached" not in st.session_state:
+        st.session_state["fetch_debug_cached"] = None
 
     if fetch_btn:
         with st.spinner("Fetching Mixpanel payments. Reduced columns, filtered, deduped..."):
-            npm_df, stats = fetch_mixpanel_npm(end_date)
+            npm_df, stats, fetch_debug = fetch_mixpanel_npm(end_date)
             st.session_state["npm_cached"] = npm_df
             st.session_state["npm_stats"] = stats
+            st.session_state["fetch_debug_cached"] = fetch_debug
             st.success("Payments fetched.")
 
     npm_df = st.session_state.get("npm_cached")
@@ -848,16 +1086,20 @@ def main():
         return
 
     stats = st.session_state.get("npm_stats") or {}
+    fetch_debug = st.session_state.get("fetch_debug_cached")
     st.sidebar.markdown("### Mixpanel fetch stats")
     st.sidebar.write(stats)
 
     with st.spinner("Building enriched dataset..."):
-        deals_enriched, summary_all, summary_connected, summary_owner_cs = build_enriched_deals(deals_raw, npm_df)
+        deals_enriched, summary_all, summary_connected, summary_owner_cs, debug_frames = build_enriched_deals(deals_raw, npm_df)
+
+    if fetch_debug is not None:
+        debug_frames["Diagnostics_fetch_prefilter"] = fetch_debug
 
     summary_view = summary_connected if focus_connected else summary_all
     kpi_row(summary_view)
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Summary", "Visuals", "Deals enriched", "Payments preview"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Summary", "Visuals", "Deals enriched", "Payments preview", "Diagnostics"])
 
     with tab1:
         st.subheader("All deals")
@@ -892,13 +1134,50 @@ def main():
         st.caption("Reduced payments dataset after filter and dedupe. First 200 rows shown.")
         st.dataframe(npm_df.head(200), use_container_width=True)
 
+    with tab5:
+        st.subheader("Diagnostics")
+        st.caption(
+            "Use this tab to check where a payment row is being lost. First check prefilter, then npm stage validity, then annual logic, then deal mapping."
+        )
+
+        fetch_diag = _filter_df_text(debug_frames.get("Diagnostics_fetch_prefilter", pd.DataFrame()), debug_filter)
+        npm_stage_diag = _filter_df_text(debug_frames.get("Diagnostics_npm_stage", pd.DataFrame()), debug_filter)
+        annual_diag = _filter_df_text(debug_frames.get("Diagnostics_annual_logic", pd.DataFrame()), debug_filter)
+        mapping_diag = _filter_df_text(debug_frames.get("Diagnostics_deal_mapping", pd.DataFrame()), debug_filter)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Fetch diag rows", 0 if fetch_diag is None else len(fetch_diag))
+        c2.metric("npm_valid rows", 0 if npm_stage_diag is None else int(npm_stage_diag["Survives npm_valid"].fillna(False).sum()) if not npm_stage_diag.empty and "Survives npm_valid" in npm_stage_diag.columns else 0)
+        c3.metric("Annual candidates", 0 if annual_diag is None else int(annual_diag["annual_candidate"].fillna(False).sum()) if not annual_diag.empty and "annual_candidate" in annual_diag.columns else 0)
+        c4.metric("Annual renew by new rule", 0 if annual_diag is None else int(annual_diag["annual_renew_action_with_breakdown"].fillna(False).sum()) if not annual_diag.empty and "annual_renew_action_with_breakdown" in annual_diag.columns else 0)
+
+        st.markdown("#### 1. Fetch prefilter diagnostics")
+        st.dataframe(fetch_diag, use_container_width=True, height=260)
+
+        st.markdown("#### 2. npm stage diagnostics")
+        st.dataframe(npm_stage_diag, use_container_width=True, height=260)
+
+        st.markdown("#### 3. Annual logic diagnostics")
+        st.dataframe(annual_diag, use_container_width=True, height=320)
+
+        st.markdown("#### 4. Deal mapping diagnostics")
+        st.dataframe(mapping_diag, use_container_width=True, height=320)
+
     st.divider()
     st.subheader("Export")
-    excel_bytes = make_excel(deals_raw, deals_enriched, summary_all, summary_connected, summary_owner_cs)
+    excel_bytes = make_excel(
+        deals_raw,
+        deals_enriched,
+        summary_all,
+        summary_connected,
+        summary_owner_cs,
+        mixpanel_stats=stats,
+        debug_frames=debug_frames,
+    )
     st.download_button(
         "Download Excel workbook",
         data=excel_bytes,
-        file_name="account_mgmt_upsell_churn_enriched.xlsx",
+        file_name="account_mgmt_upsell_churn_enriched_debug.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
