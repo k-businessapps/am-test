@@ -44,6 +44,8 @@ def init_state():
         "npm_stats": None,
         "npm_fetch_diag": None,
         "last_fetch_to_date": None,
+        "excel_export_bytes": None,
+        "excel_export_ready": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -630,11 +632,40 @@ def build_diagnostics_sheet(fetch_stats, fetch_diag_df, annual_diag_df, deals_en
         )
         frames.append(stats_df)
 
-    if fetch_diag_df is not None and not fetch_diag_df.empty:
-        frames.append(fetch_diag_df.copy())
+    annual_focus = pd.DataFrame()
+    annual_focus_emails = set()
 
     if annual_diag_df is not None and not annual_diag_df.empty:
-        frames.append(annual_diag_df.copy())
+        annual_focus = annual_diag_df[
+            annual_diag_df["annual_candidate"].fillna(False)
+            | annual_diag_df["breakdown_mask"].fillna(False)
+            | annual_diag_df["annual_renew_action_with_breakdown"].fillna(False)
+        ].copy()
+        if not annual_focus.empty:
+            annual_focus = annual_focus.sort_values(["EmailKey", "PayDT"], kind="mergesort")
+            annual_focus = annual_focus.groupby("EmailKey", dropna=False, observed=False).tail(3).copy()
+            annual_focus_emails = set(annual_focus["EmailKey"].dropna().astype(str).tolist())
+            frames.append(annual_focus)
+
+    if fetch_diag_df is not None and not fetch_diag_df.empty:
+        fetch_focus = fetch_diag_df.copy()
+        if annual_focus_emails:
+            fetch_focus = fetch_focus[
+                fetch_focus.get("extracted_email", pd.Series(index=fetch_focus.index, dtype=object)).astype(str).isin(annual_focus_emails)
+                | fetch_focus.get("$email", pd.Series(index=fetch_focus.index, dtype=object)).astype(str).isin(annual_focus_emails)
+                | fetch_focus.get("kept_after_prefilter", pd.Series(index=fetch_focus.index, dtype=bool)).fillna(False)
+            ].copy()
+        if not fetch_focus.empty:
+            fetch_focus = fetch_focus.groupby(
+                [
+                    fetch_focus.get("extracted_email", pd.Series(index=fetch_focus.index, dtype=object)).fillna(""),
+                    fetch_focus.get("$email", pd.Series(index=fetch_focus.index, dtype=object)).fillna(""),
+                    fetch_focus.get("Amount Description", pd.Series(index=fetch_focus.index, dtype=object)).fillna(""),
+                ],
+                dropna=False,
+                observed=False,
+            ).tail(2).copy()
+            frames.append(fetch_focus)
 
     if deals_enriched is not None and not deals_enriched.empty:
         mapping_cols = [
@@ -663,8 +694,13 @@ def build_diagnostics_sheet(fetch_stats, fetch_diag_df, annual_diag_df, deals_en
         ]
         mapping_cols = [c for c in mapping_cols if c is not None and c in deals_enriched.columns]
         deal_map = deals_enriched[mapping_cols].copy()
-        deal_map.insert(0, "DiagnosticSection", "deal_mapping")
-        frames.append(deal_map)
+        keep_map = deal_map["Latest Annual PayDT (AsOf MonthEnd)"].notna() | deal_map["Annual Active (AsOf MonthEnd)"].fillna(False)
+        if annual_focus_emails:
+            keep_map = keep_map | deal_map["EmailKey"].astype(str).isin(annual_focus_emails)
+        deal_map = deal_map[keep_map].copy()
+        if not deal_map.empty:
+            deal_map.insert(0, "DiagnosticSection", "deal_mapping")
+            frames.append(deal_map)
 
     if not frames:
         return pd.DataFrame()
@@ -1043,6 +1079,7 @@ def build_enriched_deals(deals_df, npm_df, fetch_diag_df=None, fetch_stats=None)
     return out, summary_all, summary_connected, summary_owner_cs, diagnostics_df
 
 
+@st.cache_data(show_spinner=False)
 def make_excel(
     deals_raw,
     deals_enriched,
@@ -1184,20 +1221,28 @@ def main():
 
     st.divider()
     st.subheader("Export")
-    excel_bytes = make_excel(
-        deals_raw=deals_raw,
-        deals_enriched=deals_enriched,
-        summary_all=summary_all,
-        summary_connected=summary_connected,
-        summary_owner_cs=summary_owner_cs,
-        diagnostics_df=diagnostics_df,
-    )
-    st.download_button(
-        "Download Excel workbook",
-        data=excel_bytes,
-        file_name="account_mgmt_upsell_churn_enriched.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    prepare_export = st.button("Prepare Excel workbook", key="prepare_excel_export")
+    if prepare_export:
+        with st.spinner("Preparing Excel workbook..."):
+            st.session_state["excel_export_bytes"] = make_excel(
+                deals_raw=deals_raw,
+                deals_enriched=deals_enriched,
+                summary_all=summary_all,
+                summary_connected=summary_connected,
+                summary_owner_cs=summary_owner_cs,
+                diagnostics_df=diagnostics_df,
+            )
+            st.session_state["excel_export_ready"] = True
+        st.success("Excel workbook prepared.")
+
+    if st.session_state.get("excel_export_ready") and st.session_state.get("excel_export_bytes") is not None:
+        st.download_button(
+            "Download Excel workbook",
+            data=st.session_state["excel_export_bytes"],
+            file_name="account_mgmt_upsell_churn_enriched.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_excel_workbook",
+        )
 
 
 if __name__ == "__main__":
