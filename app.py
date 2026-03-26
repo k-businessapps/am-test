@@ -1,4 +1,3 @@
-
 import re
 import json
 from io import BytesIO
@@ -646,6 +645,15 @@ def summarize_tier_owner_connected(deals_enriched):
     return out.rename(columns={"Deal - Owner": "Deal Owner"}).sort_values(["DealMonth", "Tier", "Deal Owner"], kind="mergesort")
 
 
+def summarize_owner_connected(deals_enriched):
+    df = deals_enriched.copy()
+    df = df[(df["DealMonth"].notna()) & (df["Connected"] == True)].copy()
+    if "Deal - Owner" not in df.columns:
+        df["Deal - Owner"] = "Unknown"
+    out = _build_summary_metrics(df, ["DealMonth", "Deal - Owner"], include_connected_pct=False)
+    return out.rename(columns={"Deal - Owner": "Deal Owner"}).sort_values(["DealMonth", "Deal Owner"], kind="mergesort")
+
+
 # -------------------------
 # Core enrichment
 # -------------------------
@@ -980,6 +988,20 @@ def build_enriched_deals(deals_df, npm_df, report_current_month, churn_cutoff_da
     return out, summary_overall, summary_tier, summary_owner, summary_tier_owner, summary_tier_owner_connected
 
 
+def _autosize_worksheet(ws, min_width=10, max_width=50, padding=2):
+    for column_cells in ws.columns:
+        lengths = []
+        for cell in column_cells:
+            value = cell.value
+            if value is None:
+                continue
+            lengths.extend(len(line) for line in str(value).splitlines())
+        if not lengths:
+            continue
+        adjusted_width = max(min_width, min(max(lengths) + padding, max_width))
+        ws.column_dimensions[column_cells[0].column_letter].width = adjusted_width
+
+
 @st.cache_data(show_spinner=False)
 def make_excel(
     deals_raw,
@@ -990,6 +1012,8 @@ def make_excel(
     summary_tier_owner,
     summary_tier_owner_connected,
 ):
+    summary_owner_connected = summarize_owner_connected(deals_enriched)
+
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         deals_enriched.to_excel(writer, sheet_name="Deals_enriched", index=False)
@@ -998,7 +1022,16 @@ def make_excel(
         summary_owner.to_excel(writer, sheet_name="Summary_owner", index=False)
         summary_tier_owner.to_excel(writer, sheet_name="Summary_tier_owner", index=False)
         summary_tier_owner_connected.to_excel(writer, sheet_name="Summary_tier_owner_conn", index=False)
+
+        connected_sheet = writer.book["Summary_tier_owner_conn"]
+        start_row = len(summary_tier_owner_connected.index) + 4
+        connected_sheet.cell(row=start_row, column=1, value="Owner wise summary for connected users")
+        summary_owner_connected.to_excel(writer, sheet_name="Summary_tier_owner_conn", index=False, startrow=start_row)
+
         deals_raw.to_excel(writer, sheet_name="Deals_raw", index=False)
+
+        for ws in writer.book.worksheets:
+            _autosize_worksheet(ws)
     return output.getvalue()
 
 
