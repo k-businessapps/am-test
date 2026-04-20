@@ -31,6 +31,8 @@ ALLOWED_ANNUAL_BREAKDOWN_NUMS = [
 
 ANNUAL_AMOUNT_THRESHOLD = 40.0
 ANNUAL_UPGRADE_DESC_EXACT = "upgrade plan to yearly subscription."
+ANNUAL_SUBSCRIPTION_TEXT_MARKERS = ["workspace subscription", "advance,", "starter,", "stater,"]
+EXCLUDED_UPSELL_DESCRIPTIONS = {"purchased credit", "credit purchased", "amount recharged"}
 
 
 # -------------------------
@@ -233,10 +235,29 @@ def _breakdown_mask_from_series(series):
     return cleaned, mask
 
 
+def _desc_matches_annual_subscription_terms(desc_lower):
+    if not desc_lower:
+        return False
+    return any(marker in desc_lower for marker in ANNUAL_SUBSCRIPTION_TEXT_MARKERS)
+
+
+def _annual_desc_series_mask(series):
+    s = series.fillna("").astype(str).str.lower().str.strip()
+    mask = pd.Series(False, index=s.index)
+    for marker in ANNUAL_SUBSCRIPTION_TEXT_MARKERS:
+        mask = mask | s.str.contains(re.escape(marker), na=False)
+    return mask
+
+
+def _excluded_credit_desc_series_mask(series):
+    s = series.fillna("").astype(str).str.strip().str.lower()
+    return s.isin(EXCLUDED_UPSELL_DESCRIPTIONS)
+
+
 def _row_is_candidate(desc_lower, breakdown_clean=""):
     if not desc_lower:
         return False
-    if "workspace subscription" in desc_lower:
+    if _desc_matches_annual_subscription_terms(desc_lower):
         return True
     if "upgrade plan to yearly subscription" in desc_lower:
         return True
@@ -498,9 +519,6 @@ def fetch_mixpanel_npm(to_date):
             breakdown_clean = _clean_breakdown_str(breakdown_source)
             desc_lower = str(amount_desc).lower().strip() if amount_desc is not None else ""
 
-            if not _row_is_candidate(desc_lower, breakdown_clean):
-                continue
-
             stats["rows_kept_prefilter"] += 1
 
             rec = {
@@ -620,7 +638,17 @@ def summarize_owner(deals_enriched):
     if "Deal - Owner" not in df.columns:
         df["Deal - Owner"] = "Unknown"
     out = _build_summary_metrics(df, ["DealMonth", "Deal - Owner"], include_connected_pct=True)
-    return out.rename(columns={"Deal - Owner": "Deal Owner"}).sort_values(["DealMonth", "Deal Owner"], kind="mergesort")
+    total_deal_value = _owner_total_deal_value(df)
+    out = out.merge(total_deal_value, on=["DealMonth", "Deal - Owner"], how="left")
+    out["Total Deal Value"] = pd.to_numeric(out["Total Deal Value"], errors="coerce").fillna(0.0)
+    out = out.rename(columns={"Deal - Owner": "Deal Owner"})
+    desired_cols = [
+        "DealMonth", "Deal Owner", "Accounts", "Connected", "Connected %",
+        "Total Deal Value", "Churn Eligible Accounts", "Churn", "Upsell (Net)",
+        "Upsell (Positive Only)", "Churn %"
+    ]
+    existing_cols = [c for c in desired_cols if c in out.columns]
+    return out[existing_cols].sort_values(["DealMonth", "Deal Owner"], kind="mergesort")
 
 
 def summarize_tier_owner(deals_enriched):
@@ -645,13 +673,49 @@ def summarize_tier_owner_connected(deals_enriched):
     return out.rename(columns={"Deal - Owner": "Deal Owner"}).sort_values(["DealMonth", "Tier", "Deal Owner"], kind="mergesort")
 
 
+def _owner_total_deal_value(df):
+    if df.empty:
+        return pd.DataFrame(columns=["DealMonth", "Deal - Owner", "Total Deal Value"])
+
+    value_df = df.copy()
+    if "Previous Month Renew Amount" not in value_df.columns:
+        value_df["Previous Month Renew Amount"] = 0.0
+
+    value_df["Previous Month Renew Amount"] = pd.to_numeric(
+        value_df["Previous Month Renew Amount"], errors="coerce"
+    ).fillna(0.0)
+
+    if "Latest Annual PayDT (AsOf MonthEnd)" in value_df.columns:
+        annual_mask = value_df["Latest Annual PayDT (AsOf MonthEnd)"].notna()
+        value_df = value_df.loc[~annual_mask].copy()
+
+    if value_df.empty:
+        return pd.DataFrame(columns=["DealMonth", "Deal - Owner", "Total Deal Value"])
+
+    return (
+        value_df.groupby(["DealMonth", "Deal - Owner"], dropna=False, observed=False)["Previous Month Renew Amount"]
+        .sum()
+        .reset_index(name="Total Deal Value")
+    )
+
+
 def summarize_owner_connected(deals_enriched):
     df = deals_enriched.copy()
     df = df[(df["DealMonth"].notna()) & (df["Connected"] == True)].copy()
     if "Deal - Owner" not in df.columns:
         df["Deal - Owner"] = "Unknown"
     out = _build_summary_metrics(df, ["DealMonth", "Deal - Owner"], include_connected_pct=False)
-    return out.rename(columns={"Deal - Owner": "Deal Owner"}).sort_values(["DealMonth", "Deal Owner"], kind="mergesort")
+    total_deal_value = _owner_total_deal_value(df)
+    out = out.merge(total_deal_value, on=["DealMonth", "Deal - Owner"], how="left")
+    out["Total Deal Value"] = pd.to_numeric(out["Total Deal Value"], errors="coerce").fillna(0.0)
+    out = out.rename(columns={"Deal - Owner": "Deal Owner"})
+    desired_cols = [
+        "DealMonth", "Deal Owner", "Accounts", "Connected",
+        "Total Deal Value", "Churn Eligible Accounts", "Churn",
+        "Upsell (Net)", "Upsell (Positive Only)", "Churn %"
+    ]
+    existing_cols = [c for c in desired_cols if c in out.columns]
+    return out[existing_cols].sort_values(["DealMonth", "Deal Owner"], kind="mergesort")
 
 
 # -------------------------
@@ -763,10 +827,10 @@ def build_enriched_deals(deals_df, npm_df, report_current_month, churn_cutoff_da
     cond_agent_added_any = desc_lower.str.contains("agent added", na=False)
     cond_number_purchased_any = desc_lower.str.contains("number purchased", na=False)
     cond_number_renew_any = desc_lower.str.contains("number renew", na=False)
-    cond_workspace_sub_any = desc_lower.str.contains("workspace subscription", na=False)
+    cond_annual_subscription_text_any = _annual_desc_series_mask(npm_valid["Amount Description"])
 
     annual_start = (npm_valid["AmountNum"].fillna(0) > ANNUAL_AMOUNT_THRESHOLD) & (
-        cond_workspace_sub_any | (desc_lower == ANNUAL_UPGRADE_DESC_EXACT)
+        cond_annual_subscription_text_any | (desc_lower == ANNUAL_UPGRADE_DESC_EXACT)
     )
 
     annual_renew_original = (npm_valid["AmountNum"].fillna(0) > ANNUAL_AMOUNT_THRESHOLD) & (
@@ -786,7 +850,7 @@ def build_enriched_deals(deals_df, npm_df, report_current_month, churn_cutoff_da
                 | cond_agent_added_any
                 | cond_number_purchased_any
                 | cond_number_renew_any
-                | cond_workspace_sub_any
+                | cond_annual_subscription_text_any
             )
         )
     )
@@ -796,10 +860,24 @@ def build_enriched_deals(deals_df, npm_df, report_current_month, churn_cutoff_da
         annual_start.loc[annual_candidates.index], "Subscription", "Renew"
     )
 
+    excluded_credit_mask = _excluded_credit_desc_series_mask(npm_valid["Amount Description"])
+    annual_user_upsell_txns = npm_valid[(~annual_start) & (~annual_renew) & (~excluded_credit_mask)].copy()
+    annual_user_upsell_by_month = (
+        annual_user_upsell_txns
+        .dropna(subset=["EmailKey", "PayMonth"])
+        .groupby(["EmailKey", "PayMonth"], dropna=False, observed=False)["AmountNum"]
+        .sum()
+        .rename("Annual User Current Month Upsell Amount")
+        .reset_index()
+    )
+    annual_user_upsell_map = annual_user_upsell_by_month.set_index(["EmailKey", "PayMonth"])[
+        "Annual User Current Month Upsell Amount"
+    ]
+
     cond_email_in_desc = contains_email
     cond_number_purchased = cond_number_purchased_any
     cond_agent_added = desc_lower.str.contains("agent added", na=False) & desc_has_comma
-    cond_workspace_sub = cond_workspace_sub_any
+    cond_workspace_sub = cond_annual_subscription_text_any
     cond_number_renew = cond_number_renew_any
     annual_action_with_breakdown = breakdown_mask & (cond_agent_added_any | cond_number_purchased_any)
 
@@ -862,6 +940,11 @@ def build_enriched_deals(deals_df, npm_df, report_current_month, churn_cutoff_da
     deals_dedup["Previous Month Renew Multiple Flag"] = [
         bool(_map_from_latest(e, m, "Renew Multiple Flag", False))
         for e, m in zip(deals_dedup["EmailKey"], deals_dedup["PrevDealMonth"])
+    ]
+
+    deals_dedup["Annual User Current Month Upsell Amount"] = [
+        float(annual_user_upsell_map.get((e, m), 0.0))
+        for e, m in zip(deals_dedup["EmailKey"], deals_dedup["DealMonth"])
     ]
 
     deal_month_index = (
@@ -977,8 +1060,21 @@ def build_enriched_deals(deals_df, npm_df, report_current_month, churn_cutoff_da
     is_annual_user_asof = deals_dedup["Latest Annual PayDT (AsOf MonthEnd)"].notna()
     eligible = (prev_amt > 0) & (~deals_dedup["Churned (AsOf MonthEnd)"]) & (~is_annual_user_asof)
 
-    deals_dedup["Upsell Net Change"] = np.where(eligible, (curr_amt - prev_amt), 0.0)
-    deals_dedup["Upsell Positive Only"] = np.where(deals_dedup["Upsell Net Change"] > 0, deals_dedup["Upsell Net Change"], 0.0)
+    monthly_upsell_net = np.where(eligible, (curr_amt - prev_amt), 0.0)
+    annual_user_upsell_amount = pd.to_numeric(
+        deals_dedup["Annual User Current Month Upsell Amount"], errors="coerce"
+    ).fillna(0.0)
+
+    deals_dedup["Upsell Net Change"] = np.where(
+        is_annual_user_asof,
+        annual_user_upsell_amount,
+        monthly_upsell_net,
+    )
+    deals_dedup["Upsell Positive Only"] = np.where(
+        deals_dedup["Upsell Net Change"] > 0,
+        deals_dedup["Upsell Net Change"],
+        0.0,
+    )
     out = deals_dedup.drop(columns=["_dedup_key", "Current Month Renew DT Fallback"], errors="ignore").copy()
     summary_overall = summarize_overall(out)
     summary_tier = summarize_tier(out)
