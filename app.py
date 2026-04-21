@@ -577,9 +577,26 @@ def fetch_mixpanel_npm(to_date):
 # -------------------------
 # Summary tables
 # -------------------------
+def _prepare_total_deal_value_base(df):
+    value_df = df.copy()
+    if "Previous Month Renew Amount" not in value_df.columns:
+        value_df["Previous Month Renew Amount"] = 0.0
+
+    value_df["Previous Month Renew Amount"] = pd.to_numeric(
+        value_df["Previous Month Renew Amount"], errors="coerce"
+    ).fillna(0.0)
+
+    if "Latest Annual PayDT (AsOf MonthEnd)" in value_df.columns:
+        annual_mask = value_df["Latest Annual PayDT (AsOf MonthEnd)"].notna()
+        value_df.loc[annual_mask, "Previous Month Renew Amount"] = 0.0
+
+    value_df["_Total Deal Value Base"] = value_df["Previous Month Renew Amount"]
+    return value_df
+
+
 def _build_summary_metrics(df, group_cols, include_connected_pct=True):
     base_cols = [
-        "Accounts", "Connected", "Churn Eligible Accounts", "Churn",
+        "Accounts", "Connected", "Total Deal Value", "Churn Eligible Accounts", "Churn",
         "Upsell (Net)", "Upsell (Positive Only)", "Churn %"
     ]
     if include_connected_pct:
@@ -589,12 +606,15 @@ def _build_summary_metrics(df, group_cols, include_connected_pct=True):
         cols = list(group_cols) + base_cols
         return pd.DataFrame(columns=cols)
 
+    work_df = _prepare_total_deal_value_base(df)
+
     out = (
-        df.groupby(group_cols, dropna=False, observed=False)
+        work_df.groupby(group_cols, dropna=False, observed=False)
         .agg(
             Accounts=("EmailKey", "size"),
             Connected=("Connected", lambda s: int(pd.Series(s).fillna(False).sum())),
             **{
+                "Total Deal Value": ("_Total Deal Value Base", lambda s: float(pd.Series(s).fillna(0).sum())),
                 "Churn Eligible Accounts": ("Churn Eligible", lambda s: int(pd.Series(s).fillna(False).sum())),
                 "Churn": ("Churned (Reporting)", lambda s: int(pd.Series(s).fillna(False).sum())),
                 "Upsell (Net)": ("Upsell Net Change", lambda s: float(pd.Series(s).fillna(0).sum())),
@@ -614,13 +634,20 @@ def _build_summary_metrics(df, group_cols, include_connected_pct=True):
         (out["Churn"] / out["Churn Eligible Accounts"]) * 100,
         np.nan,
     )
+    out["Total Deal Value"] = pd.to_numeric(out["Total Deal Value"], errors="coerce").fillna(0.0)
     return out
 
 
 def summarize_overall(deals_enriched):
     df = deals_enriched.copy()
     df = df[df["DealMonth"].notna()].copy()
-    return _build_summary_metrics(df, ["DealMonth"], include_connected_pct=True).sort_values(["DealMonth"], kind="mergesort")
+    out = _build_summary_metrics(df, ["DealMonth"], include_connected_pct=True)
+    desired_cols = [
+        "DealMonth", "Accounts", "Connected", "Connected %", "Total Deal Value",
+        "Churn Eligible Accounts", "Churn", "Upsell (Net)", "Upsell (Positive Only)", "Churn %"
+    ]
+    existing_cols = [c for c in desired_cols if c in out.columns]
+    return out[existing_cols].sort_values(["DealMonth"], kind="mergesort")
 
 
 def summarize_tier(deals_enriched):
@@ -629,7 +656,12 @@ def summarize_tier(deals_enriched):
     if "Tier" not in df.columns:
         df["Tier"] = pd.NA
     out = _build_summary_metrics(df, ["DealMonth", "Tier"], include_connected_pct=True)
-    return out.sort_values(["DealMonth", "Tier"], kind="mergesort")
+    desired_cols = [
+        "DealMonth", "Tier", "Accounts", "Connected", "Connected %", "Total Deal Value",
+        "Churn Eligible Accounts", "Churn", "Upsell (Net)", "Upsell (Positive Only)", "Churn %"
+    ]
+    existing_cols = [c for c in desired_cols if c in out.columns]
+    return out[existing_cols].sort_values(["DealMonth", "Tier"], kind="mergesort")
 
 
 def summarize_owner(deals_enriched):
@@ -638,9 +670,6 @@ def summarize_owner(deals_enriched):
     if "Deal - Owner" not in df.columns:
         df["Deal - Owner"] = "Unknown"
     out = _build_summary_metrics(df, ["DealMonth", "Deal - Owner"], include_connected_pct=True)
-    total_deal_value = _owner_total_deal_value(df)
-    out = out.merge(total_deal_value, on=["DealMonth", "Deal - Owner"], how="left")
-    out["Total Deal Value"] = pd.to_numeric(out["Total Deal Value"], errors="coerce").fillna(0.0)
     out = out.rename(columns={"Deal - Owner": "Deal Owner"})
     desired_cols = [
         "DealMonth", "Deal Owner", "Accounts", "Connected", "Connected %",
@@ -659,7 +688,14 @@ def summarize_tier_owner(deals_enriched):
     if "Deal - Owner" not in df.columns:
         df["Deal - Owner"] = "Unknown"
     out = _build_summary_metrics(df, ["DealMonth", "Tier", "Deal - Owner"], include_connected_pct=True)
-    return out.rename(columns={"Deal - Owner": "Deal Owner"}).sort_values(["DealMonth", "Tier", "Deal Owner"], kind="mergesort")
+    out = out.rename(columns={"Deal - Owner": "Deal Owner"})
+    desired_cols = [
+        "DealMonth", "Tier", "Deal Owner", "Accounts", "Connected", "Connected %",
+        "Total Deal Value", "Churn Eligible Accounts", "Churn", "Upsell (Net)",
+        "Upsell (Positive Only)", "Churn %"
+    ]
+    existing_cols = [c for c in desired_cols if c in out.columns]
+    return out[existing_cols].sort_values(["DealMonth", "Tier", "Deal Owner"], kind="mergesort")
 
 
 def summarize_tier_owner_connected(deals_enriched):
@@ -670,30 +706,27 @@ def summarize_tier_owner_connected(deals_enriched):
     if "Deal - Owner" not in df.columns:
         df["Deal - Owner"] = "Unknown"
     out = _build_summary_metrics(df, ["DealMonth", "Tier", "Deal - Owner"], include_connected_pct=False)
-    return out.rename(columns={"Deal - Owner": "Deal Owner"}).sort_values(["DealMonth", "Tier", "Deal Owner"], kind="mergesort")
+    out = out.rename(columns={"Deal - Owner": "Deal Owner"})
+    desired_cols = [
+        "DealMonth", "Tier", "Deal Owner", "Accounts", "Connected",
+        "Total Deal Value", "Churn Eligible Accounts", "Churn", "Upsell (Net)",
+        "Upsell (Positive Only)", "Churn %"
+    ]
+    existing_cols = [c for c in desired_cols if c in out.columns]
+    return out[existing_cols].sort_values(["DealMonth", "Tier", "Deal Owner"], kind="mergesort")
 
 
 def _owner_total_deal_value(df):
     if df.empty:
         return pd.DataFrame(columns=["DealMonth", "Deal - Owner", "Total Deal Value"])
 
-    value_df = df.copy()
-    if "Previous Month Renew Amount" not in value_df.columns:
-        value_df["Previous Month Renew Amount"] = 0.0
-
-    value_df["Previous Month Renew Amount"] = pd.to_numeric(
-        value_df["Previous Month Renew Amount"], errors="coerce"
-    ).fillna(0.0)
-
-    if "Latest Annual PayDT (AsOf MonthEnd)" in value_df.columns:
-        annual_mask = value_df["Latest Annual PayDT (AsOf MonthEnd)"].notna()
-        value_df = value_df.loc[~annual_mask].copy()
+    value_df = _prepare_total_deal_value_base(df)
 
     if value_df.empty:
         return pd.DataFrame(columns=["DealMonth", "Deal - Owner", "Total Deal Value"])
 
     return (
-        value_df.groupby(["DealMonth", "Deal - Owner"], dropna=False, observed=False)["Previous Month Renew Amount"]
+        value_df.groupby(["DealMonth", "Deal - Owner"], dropna=False, observed=False)["_Total Deal Value Base"]
         .sum()
         .reset_index(name="Total Deal Value")
     )
@@ -705,9 +738,6 @@ def summarize_owner_connected(deals_enriched):
     if "Deal - Owner" not in df.columns:
         df["Deal - Owner"] = "Unknown"
     out = _build_summary_metrics(df, ["DealMonth", "Deal - Owner"], include_connected_pct=False)
-    total_deal_value = _owner_total_deal_value(df)
-    out = out.merge(total_deal_value, on=["DealMonth", "Deal - Owner"], how="left")
-    out["Total Deal Value"] = pd.to_numeric(out["Total Deal Value"], errors="coerce").fillna(0.0)
     out = out.rename(columns={"Deal - Owner": "Deal Owner"})
     desired_cols = [
         "DealMonth", "Deal Owner", "Accounts", "Connected",
@@ -964,18 +994,22 @@ def build_enriched_deals(deals_df, npm_df, report_current_month, churn_cutoff_da
     )
     monthly_asof = monthly_asof.rename(columns={"Latest Monthly PayDT": "Latest Monthly PayDT (AsOf MonthEnd)"})
 
-    annual_for_asof = annual_candidates[["EmailKey", "PayDT", "Annual Payment Type"]].copy()
+    annual_for_asof = annual_candidates[
+        ["EmailKey", "PayDT", "Annual Payment Type", "Amount Description", "AmountNum"]
+    ].copy()
     annual_asof = _merge_latest_asof(
         deal_month_index,
         annual_for_asof,
         payment_dt_col="PayDT",
-        extra_cols=["Annual Payment Type"],
+        extra_cols=["Annual Payment Type", "Amount Description", "AmountNum"],
         prefix="Latest Annual "
     )
     annual_asof = annual_asof.rename(
         columns={
             "Latest Annual PayDT": "Latest Annual PayDT (AsOf MonthEnd)",
             "Latest Annual Annual Payment Type": "Annual Payment Type (AsOf MonthEnd)",
+            "Latest Annual Amount Description": "Latest Annual Amount Description (AsOf MonthEnd)",
+            "Latest Annual AmountNum": "Latest Annual Amount (AsOf MonthEnd)",
         }
     )
 
@@ -1107,8 +1141,27 @@ def make_excel(
     summary_owner,
     summary_tier_owner,
     summary_tier_owner_connected,
+    summary_owner_connected,
 ):
-    summary_owner_connected = summarize_owner_connected(deals_enriched)
+    annual_users_audit = deals_enriched[deals_enriched["Latest Annual PayDT (AsOf MonthEnd)"].notna()].copy()
+    annual_audit_cols = [
+        "DealMonth",
+        "Deal - Owner",
+        "Person - Email",
+        "EmailKey",
+        "Latest Annual PayDT (AsOf MonthEnd)",
+        "Annual Payment Type (AsOf MonthEnd)",
+        "Latest Annual Amount Description (AsOf MonthEnd)",
+        "Latest Annual Amount (AsOf MonthEnd)",
+        "Annual User Current Month Upsell Amount",
+        "Previous Month Renew Amount",
+        "Current Month Renew Amount",
+        "Upsell Net Change",
+    ]
+    annual_audit_cols = [c for c in annual_audit_cols if c in annual_users_audit.columns]
+    annual_users_audit = annual_users_audit[annual_audit_cols].sort_values(
+        ["DealMonth", "Deal - Owner", "EmailKey"], kind="mergesort"
+    )
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -1116,14 +1169,10 @@ def make_excel(
         summary_overall.to_excel(writer, sheet_name="Summary_overall", index=False)
         summary_tier.to_excel(writer, sheet_name="Summary_tier", index=False)
         summary_owner.to_excel(writer, sheet_name="Summary_owner", index=False)
+        summary_owner_connected.to_excel(writer, sheet_name="Summary_owner_connected", index=False)
         summary_tier_owner.to_excel(writer, sheet_name="Summary_tier_owner", index=False)
         summary_tier_owner_connected.to_excel(writer, sheet_name="Summary_tier_owner_conn", index=False)
-
-        connected_sheet = writer.book["Summary_tier_owner_conn"]
-        start_row = len(summary_tier_owner_connected.index) + 4
-        connected_sheet.cell(row=start_row, column=1, value="Owner wise summary for connected users")
-        summary_owner_connected.to_excel(writer, sheet_name="Summary_tier_owner_conn", index=False, startrow=start_row)
-
+        annual_users_audit.to_excel(writer, sheet_name="Annual_users_audit", index=False)
         deals_raw.to_excel(writer, sheet_name="Deals_raw", index=False)
 
         for ws in writer.book.worksheets:
@@ -1221,6 +1270,7 @@ def main():
             report_current_month=report_current_month_input,
             churn_cutoff_date=churn_cutoff_date,
         )
+        summary_owner_connected = summarize_owner_connected(deals_enriched)
 
     kpi_row(summary_overall)
 
@@ -1242,6 +1292,9 @@ def main():
 
         st.subheader("Owner wise summary")
         st.dataframe(summary_owner, use_container_width=True)
+
+        st.subheader("Owner wise summary. Connected only")
+        st.dataframe(summary_owner_connected, use_container_width=True)
 
         st.subheader("Tier and Owner wise summary")
         st.dataframe(summary_tier_owner, use_container_width=True)
@@ -1284,6 +1337,7 @@ def main():
         summary_owner=summary_owner,
         summary_tier_owner=summary_tier_owner,
         summary_tier_owner_connected=summary_tier_owner_connected,
+        summary_owner_connected=summary_owner_connected,
     )
 
     report_month_for_name = pd.Timestamp(_month_start_from_date(report_current_month_input)).strftime("%b_%Y")
